@@ -52,7 +52,7 @@
   },
   "homepage": "https://vibeslops.luckeysystems.com/",
   "dependencies": {
-    "@netlify/blobs": "^11.0.2",
+    "@netlify/blobs": "^11.1.1",
     "@recast-navigation/core": "0.43.1",
     "@recast-navigation/generators": "0.43.1",
     "@recast-navigation/three": "0.43.1",

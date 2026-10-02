@@ -11,6 +11,7 @@ import {
   SKINNABLE_TEXTURE_PATTERN,
 } from './skins.js';
 import { applyCustomCamo } from './viewmodel.js';
+import { CombatantRegistry, botCombatant, localPlayerCombatant } from './combatants.js';
 
 const UP = new THREE.Vector3(0, 1, 0);
 const MODEL_FORWARD_OFFSET = Math.PI / 2;
@@ -23,6 +24,8 @@ const _point = new THREE.Vector3();
 const _friendCenter = new THREE.Vector3();
 const _friendClosest = new THREE.Vector3();
 const _sphere = new THREE.Sphere();
+const _nearA = new THREE.Vector3();
+const _nearB = new THREE.Vector3();
 
 function findNode(root, name) {
   return root.getObjectByName(name) ?? null;
@@ -613,7 +616,7 @@ class Enemy {
     const damage = Math.max(0, Number(amount) || 0);
     const applied = Math.min(this.health, damage);
     this.health -= applied;
-    this.currentTarget = source && source !== this ? source : this.manager.player;
+    this.currentTarget = this.manager.resolveTargetSource(source, this);
     this.lastSeen.copy(this.manager.targetPosition(this.currentTarget));
     this.lastSeenTimer = 6;
     this.engaged = true;
@@ -965,6 +968,11 @@ export class EnemyManager {
     this.spawnCandidates = [];
     this.patrolPoints = [];
     this.recentSpawnMarkers = [];
+    // The registry wraps the local player now and each bot in load(); the net
+    // layer adds remote humans to the same list later.
+    this.combatants = new CombatantRegistry();
+    this.playerCombatant = localPlayerCombatant({ source: player, playerHealth });
+    this.combatants.add(this.playerCombatant);
   }
 
   async load({
@@ -1076,7 +1084,11 @@ export class EnemyManager {
     this.weaponTemplates.set('m27:', plainFallback);
     this.prepareNavigationPoints();
     const spawns = this.pickInitialSpawns();
-    for (let i = 0; i < spawns.length; i += 1) this.enemies.push(new Enemy(this, spawns[i], i));
+    for (let i = 0; i < spawns.length; i += 1) {
+      const enemy = new Enemy(this, spawns[i], i);
+      this.enemies.push(enemy);
+      this.combatants.add(botCombatant(enemy));
+    }
     return this;
   }
 
@@ -1122,6 +1134,63 @@ export class EnemyManager {
   damageFor(enemy, distance) {
     const base = damageAtDistance(enemy?.ballistics ?? WEAPON_BALLISTICS.m27, distance);
     return (base > 0 ? base : this.enemyDamage) * this.botDamageScale;
+  }
+
+  // ---- Combatant registry wiring ----
+  // The single source of truth for "who is in this fight". The local player
+  // is registered on construction; bots join in load(); the net layer adds
+  // remote humans later. Targeting, spawn safety, blasts and melee all read
+  // this list instead of hard-coding [player, ...enemies].
+
+  /** Every fighter in the match, living or dead, as target sources. */
+  targetSources() {
+    return [this.player, ...this.enemies];
+  }
+
+  /** Living fighter sources, ordered with the nearest to `position` first. */
+  targetSourcesNear(position) {
+    const sources = this.targetSources().filter((source) => !this.targetDead(source));
+    if (!position) return sources;
+    return sources.sort((a, b) =>
+      this.targetPosition(a, _nearA).distanceToSquared(position) -
+      this.targetPosition(b, _nearB).distanceToSquared(position));
+  }
+
+  /** The Combatant wrapping a target source (or null for unknown ones). */
+  combatantOf(source) {
+    if (!source) return null;
+    if (source === this.player) return this.playerCombatant;
+    return this.combatants.bySource(source) ??
+      (Number.isInteger(source.index) ? this.combatants.get(`bot-${source.index}`) : null);
+  }
+
+  /** Backwards-compat alias for the pre-registry name. */
+  targetId(source) {
+    return this.combatantIdOf(source);
+  }
+
+  /** Stable combatant id for a target source: 'player', 'bot-N', or null. */
+  combatantIdOf(source) {
+    if (!source) return null;
+    if (source === this.player) return 'player';
+    if (Number.isInteger(source.index)) return `bot-${source.index}`;
+    // A remote player passes as its own Combatant entry.
+    if (typeof source.id === 'string' && this.combatants.get(source.id) === source) return source.id;
+    return this.combatants.bySource(source)?.id ?? null;
+  }
+
+  /**
+   * Maps an arbitrary damage source to a target source the AI can chase and
+   * shoot at. Known bots and the local player pass through; anything else
+   * resolves through the registry so a remote human (whose "source" is the
+   * registry entry itself, not a bot-shaped object) still works as a target.
+   */
+  resolveTargetSource(source, perspective = null) {
+    if (!source || source === perspective) return null;
+    if (source === this.player || Number.isInteger(source.index)) return source;
+    if (typeof source.id === 'string' && this.combatants.get(source.id) === source) return source;
+    const entry = this.combatants.bySource(source) ?? this.combatants.get(source);
+    return entry ? entry.source ?? entry : null;
   }
 
   prepareNavigationPoints() {
@@ -1178,12 +1247,19 @@ export class EnemyManager {
     return this.enemies.flatMap((enemy) => enemy.dead ? [] : enemy.hitboxes);
   }
 
-  /** Living bots as blast and melee targets: { enemy, position (torso) }. */
+  /**
+   * Living non-local fighters as blast and melee targets: { enemy, position
+   * (torso) }. Built from the registry so remote humans join automatically
+   * when the net layer registers them; the local player is never a target of
+   * the local player's own melee or grenade.
+   */
   get actors() {
-    return this.enemies.filter((enemy) => !enemy.dead).map((enemy) => ({
-      enemy,
-      position: this.targetPosition(enemy, new THREE.Vector3()),
-    }));
+    const actors = [];
+    for (const entry of this.combatants.alive()) {
+      if (entry.local) continue;
+      actors.push({ enemy: entry.source ?? entry, position: entry.position(new THREE.Vector3()) });
+    }
+    return actors;
   }
 
   // Returns what the shot actually did so the HUD can confirm it. A miss and a
@@ -1233,29 +1309,39 @@ export class EnemyManager {
 
   targetDead(target) {
     if (!target) return true;
-    return target === this.player ? Boolean(this.playerHealth?.dead) : Boolean(target.dead);
-  }
-
-  targetId(target) {
-    if (!target) return null;
-    return target === this.player ? 'player' : `bot-${target.index}`;
+    if (target === this.player) return Boolean(this.playerHealth?.dead);
+    if (Number.isInteger(target.index)) return Boolean(target.dead);
+    // A remote player: liveness lives on its Combatant entry.
+    const entry = this.combatants.bySource(target) ?? this.combatants.get(target);
+    return entry ? entry.dead() : true;
   }
 
   targetPosition(target, result = new THREE.Vector3()) {
     if (!target || target === this.player) return result.copy(this.player.position);
-    return result.copy(target.root.position).addScaledVector(UP, 42);
+    if (Number.isInteger(target.index)) return result.copy(target.root.position).addScaledVector(UP, 42);
+    const entry = this.combatants.bySource(target) ?? this.combatants.get(target);
+    return entry ? entry.position(result) : null;
   }
 
   targetFeet(target, result = new THREE.Vector3()) {
     if (!target || target === this.player) return result.copy(this.player.feetPosition);
-    return result.copy(target.root.position);
+    if (Number.isInteger(target.index)) return result.copy(target.root.position);
+    const entry = this.combatants.bySource(target) ?? this.combatants.get(target);
+    return entry ? entry.feet(result) : null;
+  }
+
+  /** Planar speed of a target: player velocity, bot pace, or its combatant. */
+  targetSpeedOf(target) {
+    if (!target) return 0;
+    if (target === this.player) return Math.hypot(this.player.velocity.x, this.player.velocity.z);
+    if (Number.isInteger(target.index)) return target.movementSpeed ?? 0;
+    return this.combatantOf(target)?.horizontalSpeed() ?? 0;
   }
 
   selectTarget(enemy, minimumDot = this.visionCosine) {
     let best = null;
     let bestDistance = Infinity;
-    const candidates = [this.player, ...this.enemies];
-    for (const candidate of candidates) {
+    for (const candidate of this.targetSources()) {
       if (candidate === enemy || this.targetDead(candidate)) continue;
       const distance = enemy.root.position.distanceTo(this.targetPosition(candidate, _target));
       if (distance > this.visionRange || distance >= bestDistance) continue;
@@ -1289,9 +1375,7 @@ export class EnemyManager {
     const feet = this.targetFeet(intended, new THREE.Vector3());
     this.targetPosition(intended, _target);
     const distance = _origin.distanceTo(_target);
-    const targetSpeed = intended === this.player
-      ? Math.hypot(this.player.velocity.x, this.player.velocity.z)
-      : intended.movementSpeed;
+    const targetSpeed = this.targetSpeedOf(intended);
     const spread = enemyShotSpread(distance, {
       playerSpeed: targetSpeed,
       shooterSpeed: enemy.movementSpeed,
@@ -1309,8 +1393,8 @@ export class EnemyManager {
     let hitActor = null;
     let actorHit = null;
     let actorDistance = Infinity;
-    for (const candidate of [this.player, ...this.enemies]) {
-      if (candidate === enemy || this.targetDead(candidate)) continue;
+    for (const candidate of this.targetSourcesNear(_target)) {
+      if (candidate === enemy) continue;
       this.targetFeet(candidate, _friendCenter);
       _sphere.center.set(_friendCenter.x, _friendCenter.y + 39, _friendCenter.z);
       _sphere.radius = 19;
@@ -1355,7 +1439,7 @@ export class EnemyManager {
     _direction.multiplyScalar(1 / distance);
     this.raycaster.ray.set(_origin, _direction);
     const radiusSquared = this.friendlyFireRadius * this.friendlyFireRadius;
-    for (const teammate of [this.player, ...this.enemies]) {
+    for (const teammate of this.targetSources()) {
       if (teammate === candidate || teammate === intended || this.targetDead(teammate)) continue;
       this.targetPosition(teammate, _friendCenter);
       this.raycaster.ray.closestPointToPoint(_friendCenter, _friendClosest);
@@ -1417,7 +1501,7 @@ export class EnemyManager {
     for (const enemy of this.enemies) {
       if (enemy.dead || enemy.root.position.distanceToSquared(origin) > radius * radius) continue;
       enemy.lastSeen.copy(lastSeen);
-      enemy.currentTarget = this.player;
+      enemy.currentTarget = this.resolveTargetSource(this.player);
       enemy.lastSeenTimer = Math.max(enemy.lastSeenTimer, 3.5);
       enemy.engaged = true;
       enemy.searchTimer = 0;
@@ -1439,9 +1523,9 @@ export class EnemyManager {
     for (const candidate of this.spawnCandidates) {
       let nearest = Infinity;
       let visibleThreats = 0;
-      for (const other of [this.player, ...this.enemies]) {
-        if (other === actor || this.targetDead(other)) continue;
-        const otherPosition = this.targetPosition(other, _target);
+      for (const threat of this.targetSources()) {
+        if (threat === actor || this.targetDead(threat)) continue;
+        const otherPosition = this.targetPosition(threat, _target);
         const distance = candidate.position.distanceTo(otherPosition);
         nearest = Math.min(nearest, distance);
         _origin.copy(candidate.position).addScaledVector(UP, 42);

@@ -1341,6 +1341,9 @@ let collisionVisible = false;
 let pathPoints = 0;
 let enemies = null;
 let playerHealth = null;
+// The registry wraps the player now and each bot in load(); the net layer
+// adds remote humans to the same list later (see combatants.js).
+let playerCombatant = null;
 let hitmarkerLife = 0;
 let hitmarkerMaxLife = 0.18;
 let automationPaused = false;
@@ -1360,7 +1363,9 @@ const MEDAL_HOLD_SECONDS = 2.1;
 const MEDAL_FADE_SECONDS = 0.45;
 
 const match = new FreeForAllMatch({ scoreLimit: 30, timeLimitSeconds: 300 });
-match.register('player', 'YOU', { human: true });
+// The local player's registry id; bots are `bot-N`, remote humans join later.
+const PLAYER_COMBATANT_ID = 'player';
+match.register(PLAYER_COMBATANT_ID, 'YOU', { human: true });
 
 const touchControls = new TouchControls({
   root: document.getElementById('touch-controls'),
@@ -1724,8 +1729,7 @@ function progress(name, event) {
 }
 
 function combatantId(actor) {
-  if (!actor) return null;
-  return actor === player ? 'player' : Number.isInteger(actor.index) ? `bot-${actor.index}` : null;
+  return enemies?.combatantIdOf(actor) ?? null;
 }
 
 function resetPlayerLife() {
@@ -2007,7 +2011,7 @@ function nudgeView(pitch, yaw) {
 
 // Which side of the view a shooter is on, for the flinch: -1 left, 1 right.
 function shooterSide(source) {
-  const position = Number.isInteger(source?.index) ? enemies?.targetPosition(source) : null;
+  const position = source ? enemies?.targetPosition(source) : null;
   if (!position) return 0;
   const forward = camera.getWorldDirection(new THREE.Vector3());
   const toSource = position.clone().sub(camera.position);
@@ -2102,7 +2106,7 @@ function meleeStrike() {
   });
   if (pick) {
     const { enemy } = pick.target;
-    const applied = enemy.takeDamage(MELEE.damage, null, player);
+    const applied = enemy.takeDamage(MELEE.damage, null, playerCombatant ?? player);
     if (applied > 0) {
       showHitmarker(enemy.dead ? 'kill' : 'torso');
       weaponEffects.playHitmarker({ region: 'torso', killed: enemy.dead });
@@ -2176,7 +2180,7 @@ function onGrenadeExplode(grenade, hits) {
   if (!player) return;
   const at = grenade.position;
   for (const { actor, damage } of hits) {
-    const applied = actor.enemy?.takeDamage(damage, null, grenade.owner === player ? player : null) ?? 0;
+    const applied = actor.enemy?.takeDamage(damage, null, grenade.owner === player ? (playerCombatant ?? player) : null) ?? 0;
     if (applied > 0 && grenade.owner === player) {
       showHitmarker(actor.enemy.dead ? 'kill' : 'torso');
       weaponEffects.playHitmarker({ region: 'torso', killed: actor.enemy.dead });
@@ -2346,6 +2350,8 @@ function getDebugState() {
       visualState: enemy.visualState,
       visualFrame: enemy.visualFrameIndex,
     })) ?? [],
+    // Who the AI can currently reach: player, bots, and later remote humans.
+    combatants: enemies?.combatants?.getState() ?? [],
     lighting: {
       sky: Boolean(lightingApplied?.sky),
       environment: Boolean(lightingApplied?.environment),
@@ -2758,7 +2764,7 @@ async function start() {
       onDeath: ({ source }) => {
         clearKeys();
         deathSource = source;
-        match.recordKill(combatantId(source), 'player');
+        match.recordKill(combatantId(source), PLAYER_COMBATANT_ID);
         medals?.onDeath();
         player.setEnabled(false);
         weapon.setTrigger(false);
@@ -2790,9 +2796,9 @@ async function start() {
           sightBlocked: (from, to) => grenades?.smokeBlocks(from, to) ?? false,
           onDeath: (victim, source) => {
             const fell = victim.root.position;
-            const byPlayer = combatantId(source) === 'player';
+            const byPlayer = combatantId(source) === PLAYER_COMBATANT_ID;
             const distance = byPlayer ? player.position.distanceTo(fell) : null;
-            match.recordKill(combatantId(source), `bot-${victim.index}`, distance === null ? null : { distance });
+            match.recordKill(combatantId(source), enemies.combatantIdOf(victim), distance === null ? null : { distance });
             worldAudio?.death({ position: fell.clone() });
             worldAudio?.bodyfall({ surface: surfaceProbe?.surfaceAt(fell), position: fell.clone() });
             // Bot-on-bot kills stay out of the human player's medal chain.
@@ -2810,6 +2816,9 @@ async function start() {
         })).load({ onProgress: (label, event) => progress(label, event) })
       : Promise.resolve()
     ).finally(() => frontend.stage('enemy'));
+    // The registry lives on the manager; the page keeps the local player's
+    // entry at hand for melee and grenade attribution.
+    playerCombatant = enemies?.playerCombatant ?? null;
 
     await Promise.all([viewmodelPromise, weaponEffects.loadAudio(), enemyPromise, loadEnvironment()]);
     refreshTextureFiltering();
